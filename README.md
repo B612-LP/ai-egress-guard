@@ -70,7 +70,7 @@ DSH / ChatGPT App 的 GPT 请求
 | `~/.dsh/state/ai-egress.json` | 当前状态：`status` / `node` / `checked_at` / `success_at` |
 | `~/Library/Logs/ai-egress-guard.log` | 巡检与事件日志（fault_confirmed / candidate_* / unavailable / origin_restored / healthy …） |
 | `~/Library/Logs/ai-egress-guard.launchd.log` | launchd 标准输出 |
-| `~/.dsh/state/ai-egress.scout.json` | 备用候选缓存（侦察产出） |
+| `~/.dsh/state/ai-egress-standbys.json` | 备用候选缓存（侦察产出） |
 
 ## 实测数据（2026-11，单用户 Mac）
 
