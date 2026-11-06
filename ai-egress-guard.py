@@ -27,6 +27,14 @@ SCOUT_LABEL = 'com.b612.ai-egress-scout'
 CACHE_VERSION = 2
 BACKGROUND_CONCURRENCY = 2
 RECOVERY_CONCURRENCY = 6
+STANDBY_RETRY_DELAY = 2
+
+
+def subscriptions(path):
+    """Explicit exact node-to-subscription mapping; never infer from names."""
+    value = load(path)
+    return {node: source for node, source in value.items()
+            if isinstance(node, str) and node and isinstance(source, str) and source.strip()}
 
 
 def numeric(value):
@@ -82,6 +90,7 @@ class Guard:
         self.root = self.home / '.dsh/state'
         self.root.mkdir(parents=True, exist_ok=True)
         self.cache_path = self.root / 'ai-egress-standbys.json'
+        self.subscriptions_path = self.root / 'ai-egress-subscriptions.json'
         self.state_path = self.root / 'ai-egress.json'
         self.log_path = self.home / 'Library/Logs/ai-egress-guard.log'
         sockets = glob.glob('/var/folders/*/*/T/verge-mihomo.sock')
@@ -164,7 +173,8 @@ class Guard:
             profile, stamp = 'unknown', []
         members = list(dict.fromkeys(n for n in group['all'] if isinstance(n, str)
                                      and n not in ('DIRECT', 'REJECT', 'GLOBAL', GROUP)))
-        value = [self.network_identity(), profile, stamp, members, self.sock]
+        value = [self.network_identity(), profile, stamp, members, self.sock,
+                 subscriptions(self.subscriptions_path)]
         epoch = hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
         latest = self.group()
         if latest['all'] != group['all']:
@@ -213,6 +223,14 @@ class Guard:
             for name in ('ai-egress.idle', 'ai-egress.slow'):
                 (self.root/name).write_text('0\n')
 
+    def ordered(self, nodes, members, current):
+        mapping = subscriptions(self.subscriptions_path)
+        source = mapping.get(current)
+        # Only explicitly known different subscriptions receive priority.
+        return sorted(nodes, key=lambda n: (0 if source and mapping.get(n)
+                                            and mapping[n] != source else 1,
+                                            members.index(n)))
+
     def ranked(self, records, members, current, failed=None):
         now = time.time()
         failed = failed if isinstance(failed, dict) else {}
@@ -231,7 +249,11 @@ class Guard:
             if numeric(failure) and failure >= start:
                 continue
             valid.append(d)
-        valid.sort(key=lambda d: (d['delay_ms'], -d['success_at'], members.index(d['node'])))
+        mapping = subscriptions(self.subscriptions_path)
+        source = mapping.get(current)
+        valid.sort(key=lambda d: (0 if source and mapping.get(d['node'])
+                                  and mapping[d['node']] != source else 1,
+                                  d['delay_ms'], -d['success_at'], members.index(d['node'])))
         unique = []
         for d in valid:
             if d['node'] not in [v['node'] for v in unique]:
@@ -243,14 +265,16 @@ class Guard:
             return []
         return self.ranked(cache.get('candidates', []), members, current, cache.get('failed_at'))
 
-    def cache_update(self, epoch, update):
+    def cache_update(self, epoch, update, background=False):
         # Slow local control/network sampling must NEVER hold the shared write lock.
         # Observation order prevents a late old-epoch sample replacing a new epoch.
         observed_ns = time.time_ns()
         live_epoch, live_members, live_current = self.context()
         if live_epoch != epoch:
             raise ContextChanged('Stale cache writer')
-        with self.lock('ai-egress-cache.lock', blocking=True):
+        with self.lock('ai-egress-cache.lock', blocking=True), ExitStack() as transaction:
+            if background and not transaction.enter_context(self.lock('ai-egress-recovery.lock', shared=True)):
+                raise ContextChanged('Recovery preempted scout commit')
             cache = load(self.cache_path)
             last_observed = cache.get('context_observed_ns', 0)
             if not numeric(last_observed) or last_observed > time.time_ns():
@@ -577,45 +601,88 @@ class Guard:
                     return
                 if not self.base_network_ok():
                     self.cache_update(epoch, lambda c: c.update(candidates=[], next_refresh=now+REFRESH,
-                                                               status='network_unknown', checked_at=now))
+                                                               status='network_unknown', checked_at=now), background=True)
                     return
                 started = time.monotonic()
                 existing = self.valid(cache, epoch, members, current)
                 first = [d['node'] for d in existing]
-                rest = [n for n in members if n != current and n not in first]
-                # Keep this round's measured results, not only the cached top two:
-                # a later failure of an old fast candidate must reveal the next best.
-                measured = {d['node']: d for d in existing}
-                publication = threading.Lock()
-                scanned = 0
-                successful = 0
-                def publish(result):
+                scanned = successful = 0
+
+                def batch(nodes):
+                    # A fixed-size batch prevents eager worker dispatch from scanning
+                    # the whole pool while the consumer is deciding whether to stop.
                     nonlocal scanned, successful
-                    with publication:
-                        scanned += 1
-                        node = result['node']
-                        measured.pop(node, None)
-                        if result['delay_ms'] is not None:
-                            measured[node] = result
-                            successful += 1
-                        def change(c):
-                            failed = c['failed_at']
+                    results = []
+                    scan = self.coarse_candidates(nodes, background=True, on_result=results.append)
+                    try:
+                        for _ in scan:
+                            pass
+                    finally:
+                        scan.close()
+                    with self.lock('ai-egress-recovery.lock', shared=True) as idle:
+                        if not idle:
+                            raise ContextChanged('Recovery preempted scout')
+                    live_epoch, _, live_current = self.context()
+                    if live_epoch != epoch or live_current != current or len(results) != len(nodes):
+                        raise ContextChanged('Scout context changed or preempted')
+                    scanned += len(results)
+                    successful += sum(r['delay_ms'] is not None for r in results)
+                    return results
+
+                def publish(results):
+                    # Merge against the latest cache, never against a stale local
+                    # snapshot: a foreground failure marker dominates old probes.
+                    with self.lock('ai-egress-recovery.lock', shared=True) as idle:
+                        if not idle:
+                            raise ContextChanged('Recovery preempted scout')
+                    live_epoch, _, live_current = self.context()
+                    if live_epoch != epoch or live_current != current:
+                        raise ContextChanged('Scout selection changed')
+                    def change(c):
+                        records = {r['node']: r for r in c['candidates']
+                                   if isinstance(r, dict) and isinstance(r.get('node'), str)}
+                        for result in results:
+                            node = result['node']
+                            previous = records.get(node)
+                            if previous and previous.get('started_at', 0) > result['started_at']:
+                                continue
                             if result['delay_ms'] is None:
-                                failed[node] = max(failed.get(node, 0), result['success_at'])
-                            c['candidates'] = self.ranked(list(measured.values()), members, current, failed)
-                            c['status'] = 'ready' if len(c['candidates']) == 2 else 'insufficient'
-                        self.cache_update(epoch, change)
-                candidates = self.coarse_candidates(first + rest, background=True, on_result=publish)
-                try:
-                    for result in candidates:
-                        with self.lock('ai-egress-recovery.lock', shared=True) as idle:
-                            if not idle:
-                                return
-                        live_epoch, _, live_current = self.context()
-                        if live_epoch != epoch or live_current != current:
-                            return
-                finally:
-                    candidates.close()
+                                c['failed_at'][node] = max(c['failed_at'].get(node, 0), result['success_at'])
+                                records.pop(node, None)
+                            elif c['failed_at'].get(node, 0) < result['started_at']:
+                                records[node] = result
+                        c['candidates'] = list(records.values())
+                        c['status'] = 'ready' if len(self.ranked(c['candidates'], members, current,
+                                                                c['failed_at'])) == 2 else 'insufficient'
+                    self.cache_update(epoch, change, background=True)
+
+                # Recheck only the current standbys, and confirm failures before
+                # evicting them. No replacement scan until these checks finish.
+                if first:
+                    results = batch(first)
+                    failed = [r['node'] for r in results if r['delay_ms'] is None]
+                    if failed:
+                        time.sleep(STANDBY_RETRY_DELAY)
+                        retry = batch(failed)
+                        retried = {r['node']: r for r in retry}
+                        results = [retried.get(r['node'], r) for r in results]
+                    publish(results)
+
+                attempted = set(first)
+                rest = self.ordered([n for n in members if n != current and n not in attempted],
+                                    members, current)
+                while rest:
+                    current_cache = load(self.cache_path)
+                    count = len(self.valid(current_cache, epoch, members, current))
+                    if count >= 2:
+                        break
+                    # Never dispatch more than the number still needed.
+                    nodes, rest = rest[:min(BACKGROUND_CONCURRENCY, 2-count)], rest[min(BACKGROUND_CONCURRENCY, 2-count):]
+                    results = batch(nodes)
+                    # New candidates have not been retained before; one failure is
+                    # enough to skip them for this round, not to evict a standby.
+                    publish(results)
+
                 with self.lock('ai-egress-recovery.lock', shared=True) as idle:
                     if not idle:
                         return
@@ -623,11 +690,11 @@ class Guard:
                 if live_epoch != epoch or live_current != current:
                     return
                 def commit(c):
-                    c['candidates'] = self.ranked(list(measured.values()), members, current, c['failed_at'])
                     c.update(next_refresh=time.time()+REFRESH,
-                             status='ready' if len(c['candidates']) == 2 else 'insufficient',
+                             status='ready' if len(self.ranked(c['candidates'], members, current,
+                                                               c['failed_at'])) == 2 else 'insufficient',
                              checked_at=time.time())
-                self.cache_update(epoch, commit)
+                self.cache_update(epoch, commit, background=True)
                 result = load(self.cache_path)
                 self.log('standbys_refreshed', count=len(result.get('candidates', [])),
                          nodes=[d['node'] for d in result.get('candidates', [])],

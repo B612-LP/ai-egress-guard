@@ -60,7 +60,7 @@ launchd 已在常态运行（`com.b612.ai-egress-guard` 10s 一轮、`com.b612.a
 
 `success_at` 是最近一次 healthy 的时间戳；`checked_at` 是本轮时间。**判断新鲜度用这两个字段，不要用文件 mtime。**
 
-备用候选缓存：`~/.dsh/state/ai-egress-standbys.json`（侦察产出，含粗筛延迟），可作为「接下来该试谁」的参考。
+备用候选缓存：`~/.dsh/state/ai-egress-standbys.json`（侦察产出，含粗筛延迟），可作为「接下来该试谁」的参考。后台最多维护两个备胎，定时复测现有备胎，失败复测确认、不足才分批补选；优先另一订阅，找够即停。订阅归属由 `~/.dsh/state/ai-egress-subscriptions.json` 显式映射节点名到订阅 ID，未知时不猜。后台不切换健康出口；粗筛通过不代表账号可用。
 
 ## 4. 常见对话怎么答
 
@@ -79,7 +79,7 @@ launchd 已在常态运行（`com.b612.ai-egress-guard` 10s 一轮、`com.b612.a
 
 ## 6. 配置速查
 
-配置入口只剩一个环境变量；其余是 `ai-egress-guard.py` 顶部常量（改常量 = 改代码，改完 launchd 下轮自动生效）：
+控制器密钥使用环境变量，订阅归属使用上面的本地 JSON 文件；其余是 `ai-egress-guard.py` 顶部常量（改常量 = 改代码，改完 launchd 下轮自动生效）：
 
 | 项 | 值 | 说明 |
 |---|---|---|
